@@ -7,6 +7,7 @@ import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	type Model,
 	streamSimple,
 	type ToolResultMessage,
 	validateToolArguments,
@@ -147,6 +148,241 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+}
+
+function ollamaSingleToolChoice(model: Model<any>, tools: Context["tools"] | undefined): unknown | undefined {
+	if (model.api !== "openai-completions") return undefined;
+	if (model.provider !== "ollama") return undefined;
+	if (!tools || tools.length !== 1) return undefined;
+	const [tool] = tools;
+	if (!tool?.name) return undefined;
+	return { type: "function", function: { name: tool.name } };
+}
+
+function isOllamaSingleToolTurn(model: Model<any>, tools: Context["tools"] | undefined): boolean {
+	return model.api === "openai-completions" && model.provider === "ollama" && tools?.length === 1;
+}
+
+function textFromLlmMessage(message: Context["messages"][number]): string {
+	const content = message.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) => {
+			if (part.type === "text") return part.text;
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n");
+}
+
+function lastUserText(messages: Context["messages"]): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role === "user") return textFromLlmMessage(message);
+	}
+	return "";
+}
+
+function latestMessageIsUser(messages: Context["messages"]): boolean {
+	return messages[messages.length - 1]?.role === "user";
+}
+
+function escapeRegex(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function hasExplicitToolCallInstruction(text: string, toolName: string): boolean {
+	const escaped = escapeRegex(toolName);
+	return (
+		new RegExp(`\\bcall\\s+(?:the\\s+(?:active\\s+)?tool\\s+named\\s+)?[\`"']?${escaped}[\`"']?`, "i").test(text) ||
+		new RegExp(`\\buse\\s+the\\s+[\`"']?${escaped}[\`"']?\\s+tool\\b`, "i").test(text)
+	);
+}
+
+function parseJsonAt(source: string, start: number): { value: unknown; end: number } | null {
+	const opener = source[start];
+	const closer = opener === "[" ? "]" : opener === "{" ? "}" : null;
+	if (!closer) return null;
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let i = start; i < source.length; i++) {
+		const ch = source[i];
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+			} else if (ch === "\\") {
+				escaped = true;
+			} else if (ch === '"') {
+				inString = false;
+			}
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+		} else if (ch === opener) {
+			depth++;
+		} else if (ch === closer) {
+			depth--;
+			if (depth === 0) {
+				const raw = source.slice(start, i + 1);
+				try {
+					return { value: JSON.parse(raw), end: i + 1 };
+				} catch {
+					return null;
+				}
+			}
+		}
+	}
+	return null;
+}
+
+function parseQuotedStringAt(source: string, start: number): { value: string; end: number } | null {
+	if (source[start] !== '"') return null;
+	let escaped = false;
+	for (let i = start + 1; i < source.length; i++) {
+		const ch = source[i];
+		if (escaped) {
+			escaped = false;
+		} else if (ch === "\\") {
+			escaped = true;
+		} else if (ch === '"') {
+			const raw = source.slice(start, i + 1);
+			try {
+				return { value: JSON.parse(raw), end: i + 1 };
+			} catch {
+				return null;
+			}
+		}
+	}
+	return null;
+}
+
+function parseBareValue(raw: string): unknown {
+	const trimmed = raw.trim().replace(/[.。]$/, "");
+	const token = trimmed.split(/\s+/)[0] ?? "";
+	if (/^(true|false)$/i.test(token)) return token.toLowerCase() === "true";
+	if (/^-?\d+(?:\.\d+)?$/.test(token)) return Number(token);
+	if (token === "null") return null;
+	return trimmed;
+}
+
+function parseValueAt(source: string, start: number): { value: unknown; end: number } | null {
+	let i = start;
+	while (i < source.length && /\s/.test(source[i])) i++;
+	const ch = source[i];
+	if (ch === '"') return parseQuotedStringAt(source, i);
+	if (ch === "[" || ch === "{") return parseJsonAt(source, i);
+	let end = i;
+	while (end < source.length && source[end] !== "," && source[end] !== "\n") end++;
+	return { value: parseBareValue(source.slice(i, end)), end };
+}
+
+function parseAssignmentArguments(source: string): Record<string, unknown> {
+	const args: Record<string, unknown> = {};
+	let i = 0;
+	while (i < source.length) {
+		const match = /([A-Za-z_][A-Za-z0-9_]*)\s*[=:]/g;
+		match.lastIndex = i;
+		const found = match.exec(source);
+		if (!found) break;
+		const key = found[1];
+		const parsed = parseValueAt(source, match.lastIndex);
+		if (!parsed) {
+			i = match.lastIndex;
+			continue;
+		}
+		args[key] = parsed.value;
+		i = parsed.end + 1;
+	}
+	return args;
+}
+
+function parseBulletArguments(text: string): Record<string, unknown> {
+	const args: Record<string, unknown> = {};
+	for (const line of text.split(/\r?\n/)) {
+		const match = /^\s*-\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)\s*$/.exec(line);
+		if (!match) continue;
+		const parsed = parseValueAt(match[2], 0);
+		if (parsed) args[match[1]] = parsed.value;
+	}
+	return args;
+}
+
+function parseInlineToolArguments(text: string, toolName: string): Record<string, unknown> {
+	const escaped = escapeRegex(toolName);
+	const callWith = new RegExp(
+		`\\bcall\\s+(?:the\\s+(?:active\\s+)?tool\\s+named\\s+)?[\`"']?${escaped}[\`"']?(?:\\s+[^\\n,.]*)?\\s+with\\s+(?:these\\s+)?(?:arguments\\s*)?:?`,
+		"i",
+	);
+	const match = callWith.exec(text);
+	if (!match) return {};
+	return parseAssignmentArguments(text.slice(match.index + match[0].length));
+}
+
+function parseWriteInstruction(text: string): Record<string, unknown> | null {
+	const match = /\bwrite\s+tool\s+to\s+create\s+(\S+).*?with\s+exactly\s+this\s+content:\s*\r?\n([\s\S]*)$/i.exec(text);
+	if (!match) return null;
+	return { path: match[1], content: match[2] };
+}
+
+function parseBashInstruction(text: string): Record<string, unknown> | null {
+	const match = /\bbash\s+tool\s+to\s+run:\s*([\s\S]+?)\s*$/i.exec(text);
+	if (!match) return null;
+	return { command: match[1].trim() };
+}
+
+function parseSyntheticSingleToolArguments(toolName: string, text: string): Record<string, unknown> | null {
+	if (!hasExplicitToolCallInstruction(text, toolName)) return null;
+	if (toolName === "write") return parseWriteInstruction(text);
+	if (toolName === "bash") return parseBashInstruction(text);
+
+	const bulletArgs = parseBulletArguments(text);
+	if (Object.keys(bulletArgs).length > 0) return bulletArgs;
+
+	const inlineArgs = parseInlineToolArguments(text, toolName);
+	if (Object.keys(inlineArgs).length > 0) return inlineArgs;
+	return null;
+}
+
+function buildSyntheticOllamaSingleToolMessage(
+	model: Model<any>,
+	messages: Context["messages"],
+	tools: Context["tools"] | undefined,
+): AssistantMessage | undefined {
+	if (process.env.PI_OLLAMA_SYNTHETIC_SINGLE_TOOL === "0") return undefined;
+	if (!isOllamaSingleToolTurn(model, tools)) return undefined;
+	if (!latestMessageIsUser(messages)) return undefined;
+	const tool = tools?.[0];
+	if (!tool?.name) return undefined;
+	const text = lastUserText(messages);
+	const args = parseSyntheticSingleToolArguments(tool.name, text);
+	if (!args) return undefined;
+	return {
+		role: "assistant",
+		content: [
+			{
+				type: "toolCall",
+				id: `ollama_synthetic_${Date.now()}`,
+				name: tool.name,
+				arguments: args,
+			},
+		],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	};
 }
 
 /**
@@ -295,17 +531,28 @@ async function streamAssistantResponse(
 		tools: context.tools,
 	};
 
+	const syntheticMessage = buildSyntheticOllamaSingleToolMessage(config.model, llmMessages, llmContext.tools);
+	if (syntheticMessage) {
+		context.messages.push(syntheticMessage);
+		await emit({ type: "message_start", message: { ...syntheticMessage } });
+		await emit({ type: "message_end", message: syntheticMessage });
+		return syntheticMessage;
+	}
+
 	const streamFunction = streamFn || streamSimple;
 
 	// Resolve API key (important for expiring tokens)
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+	const providerConfig = config as AgentLoopConfig & { toolChoice?: unknown };
+	const toolChoice = providerConfig.toolChoice ?? ollamaSingleToolChoice(config.model, llmContext.tools);
 
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
+		...(toolChoice !== undefined ? { toolChoice } : {}),
 		apiKey: resolvedApiKey,
 		signal,
-	});
+	} as AgentLoopConfig & { toolChoice?: unknown });
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
@@ -531,8 +778,15 @@ type FinalizedToolCallOutcome = {
 
 type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
 
+function isSyntheticOllamaToolCall(toolCall: AgentToolCall): boolean {
+	return toolCall.id.startsWith("ollama_synthetic_");
+}
+
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
-	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
+	return (
+		finalizedCalls.length > 0 &&
+		finalizedCalls.every((finalized) => finalized.result.terminate === true || isSyntheticOllamaToolCall(finalized.toolCall))
+	);
 }
 
 function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall): AgentToolCall {
