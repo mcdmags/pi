@@ -51,6 +51,21 @@ function createModel(): Model<"openai-responses"> {
 	};
 }
 
+function createOllamaModel(): Model<"openai-completions"> {
+	return {
+		id: "qwen3.5:9b",
+		name: "Qwen",
+		api: "openai-completions",
+		provider: "ollama",
+		baseUrl: "http://localhost:11434/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 8192,
+	};
+}
+
 function createAssistantMessage(
 	content: AssistantMessage["content"],
 	stopReason: AssistantMessage["stopReason"] = "stop",
@@ -181,6 +196,186 @@ describe("agentLoop with AgentMessage", () => {
 		// The notification should have been filtered out in convertToLlm
 		expect(convertedMessages.length).toBe(1); // Only user message
 		expect(convertedMessages[0].role).toBe("user");
+	});
+
+	it("forces concrete tool_choice for Ollama single-tool turns", async () => {
+		const tool: AgentTool = {
+			name: "cue_ralph",
+			description: "Run Ralph",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+		};
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [tool],
+		};
+		const userPrompt: AgentMessage = createUserMessage("run the tool");
+		const config: AgentLoopConfig = {
+			model: createOllamaModel(),
+			convertToLlm: identityConverter,
+			shouldStopAfterTurn: ({ toolResults }) => toolResults.length > 0,
+		};
+		let capturedToolChoice: unknown;
+
+		const streamFn = (_model: Model<any>, _context: any, options: any) => {
+			capturedToolChoice = options?.toolChoice;
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		for await (const _ of agentLoop([userPrompt], context, config, undefined, streamFn)) {
+			// consume
+		}
+
+		expect(capturedToolChoice).toEqual({ type: "function", function: { name: "cue_ralph" } });
+	});
+
+	it("synthesizes explicit Ollama single-tool calls without waiting for the provider", async () => {
+		const toolSchema = Type.Object({
+			feature_name: Type.String(),
+			epic: Type.String(),
+			description: Type.String(),
+			tasks: Type.Array(Type.String()),
+			mode: Type.String(),
+		});
+		let executedArgs: Record<string, unknown> | undefined;
+		const tool: AgentTool = {
+			name: "cue_plan_create",
+			description: "Create plan",
+			parameters: toolSchema,
+			execute: async (_toolCallId, params) => {
+				executedArgs = params as Record<string, unknown>;
+				return { content: [{ type: "text", text: "ok" }] };
+			},
+		};
+		const config: AgentLoopConfig = {
+			model: createOllamaModel(),
+			convertToLlm: identityConverter,
+			shouldStopAfterTurn: ({ toolResults }) => toolResults.length > 0,
+		};
+		let streamCalled = false;
+		const streamFn = () => {
+			streamCalled = true;
+			throw new Error("provider should not be called");
+		};
+		const prompt = createUserMessage(
+			'Call cue_plan_create with feature_name="probe", epic="dev-experience", description="Probe", tasks=["Task A"], mode="full".',
+		);
+		const events: AgentEvent[] = [];
+
+		for await (const event of agentLoop(
+			[prompt],
+			{ systemPrompt: "x", messages: [], tools: [tool] },
+			config,
+			undefined,
+			streamFn,
+		)) {
+			events.push(event);
+		}
+
+		expect(streamCalled).toBe(false);
+		expect(executedArgs).toEqual({
+			feature_name: "probe",
+			epic: "dev-experience",
+			description: "Probe",
+			tasks: ["Task A"],
+			mode: "full",
+		});
+		expect(events.some((event) => event.type === "tool_execution_start" && event.toolName === "cue_plan_create")).toBe(
+			true,
+		);
+	});
+
+	it("synthesizes explicit Ollama write-tool instructions with full content", async () => {
+		const toolSchema = Type.Object({
+			path: Type.String(),
+			content: Type.String(),
+		});
+		let executedArgs: Record<string, unknown> | undefined;
+		const tool: AgentTool = {
+			name: "write",
+			description: "Write file",
+			parameters: toolSchema,
+			execute: async (_toolCallId, params) => {
+				executedArgs = params as Record<string, unknown>;
+				return { content: [{ type: "text", text: "ok" }] };
+			},
+		};
+		const config: AgentLoopConfig = {
+			model: createOllamaModel(),
+			convertToLlm: identityConverter,
+			shouldStopAfterTurn: ({ toolResults }) => toolResults.length > 0,
+		};
+		const prompt = createUserMessage(
+			"Use the write tool to create demo.html in the current working directory with exactly this content:\n<!doctype html>\n<title>Demo</title>\n",
+		);
+
+		for await (const _ of agentLoop(
+			[prompt],
+			{ systemPrompt: "x", messages: [], tools: [tool] },
+			config,
+			undefined,
+			() => {
+				throw new Error("provider should not be called");
+			},
+		)) {
+			// consume
+		}
+
+		expect(executedArgs).toEqual({
+			path: "demo.html",
+			content: "<!doctype html>\n<title>Demo</title>\n",
+		});
+	});
+
+	it("does not force tool_choice for non-Ollama or multi-tool turns", async () => {
+		const makeTool = (name: string): AgentTool => ({
+			name,
+			description: name,
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+		});
+		const userPrompt: AgentMessage = createUserMessage("run tools");
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+		const captured: unknown[] = [];
+		const streamFn = (_model: Model<any>, _context: any, options: any) => {
+			captured.push(options?.toolChoice);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		};
+
+		for await (const _ of agentLoop(
+			[userPrompt],
+			{ systemPrompt: "x", messages: [], tools: [makeTool("read")] },
+			config,
+			undefined,
+			streamFn,
+		)) {
+			// consume
+		}
+		for await (const _ of agentLoop(
+			[userPrompt],
+			{ systemPrompt: "x", messages: [], tools: [makeTool("read"), makeTool("write")] },
+			{ ...config, model: createOllamaModel() },
+			undefined,
+			streamFn,
+		)) {
+			// consume
+		}
+
+		expect(captured).toEqual([undefined, undefined]);
 	});
 
 	it("should apply transformContext before convertToLlm", async () => {
